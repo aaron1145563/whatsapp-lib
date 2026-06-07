@@ -6,24 +6,20 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 
-// ── CONFIG ────────────────────────────────────────────────────────────────────
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
-const GROUP_NAME        = process.env.GROUP_NAME || ""; // nombre del grupo
+const GROUP_NAME        = process.env.GROUP_NAME || "";
 const PORT              = process.env.PORT || 3000;
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-// Cuentas bancarias — se guardan en cuentas.json
 const CUENTAS_FILE = path.join(__dirname, "cuentas.json");
 function loadCuentas() {
   try { return JSON.parse(fs.readFileSync(CUENTAS_FILE, "utf8")); } catch { return []; }
 }
 function saveCuentas(c) { fs.writeFileSync(CUENTAS_FILE, JSON.stringify(c, null, 2)); }
 
-// Cola de notas pendientes de selección de cuenta
-// id → { clienteTel, clienteNombre, total, media, mime, caption, timestamp }
 const pendientes = {};
-let groupId = null; // se detecta automático
+let groupId = null;
 const logs = [];
 
 function addLog(tipo, msg) {
@@ -33,12 +29,21 @@ function addLog(tipo, msg) {
   console.log(`[${tipo.toUpperCase()}] ${msg}`);
 }
 
-// ── WHATSAPP CLIENT ───────────────────────────────────────────────────────────
+// ── WHATSAPP CLIENT ── con puppeteer configurado para Render ─────────────────
 const waClient = new Client({
   authStrategy: new LocalAuth({ dataPath: ".wa-session" }),
   puppeteer: {
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-accelerated-2d-canvas",
+      "--no-first-run",
+      "--no-zygote",
+      "--single-process",
+      "--disable-gpu"
+    ]
   }
 });
 
@@ -66,7 +71,6 @@ waClient.on("message", async (msg) => {
   try {
     const chat = await msg.getChat();
 
-    // Detectar y guardar ID del grupo por nombre
     if (chat.isGroup && !groupId) {
       if (!GROUP_NAME || chat.name.toLowerCase().includes(GROUP_NAME.toLowerCase())) {
         groupId = chat.id._serialized;
@@ -74,14 +78,12 @@ waClient.on("message", async (msg) => {
       }
     }
 
-    // Solo procesar mensajes del grupo configurado
     if (!chat.isGroup) return;
     if (groupId && chat.id._serialized !== groupId) return;
-
-    // Solo PDFs e imágenes
     if (!msg.hasMedia) return;
+
     const tipo = msg.type;
-    if (!["document", "image", "ptt"].includes(tipo) && !msg.hasMedia) return;
+    if (!["document", "image"].includes(tipo)) return;
 
     addLog("info", `Archivo recibido en grupo (${tipo}) — analizando con IA...`);
 
@@ -107,12 +109,12 @@ waClient.on("message", async (msg) => {
             type: "text",
             text: `Analiza este documento. Responde SOLO con JSON sin markdown:
 {
-  "tipo": "nota" si es cotización/nota de pedido, "guia" si es guía de envío/tracking, "otro" si no es ninguna,
-  "telefono": "teléfono del cliente en la parte superior del documento, formato 521XXXXXXXXXX, sin espacios ni guiones, vacío si no hay",
+  "tipo": "nota" si es cotización/nota de pedido, "guia" si es guía de envío, "otro" si no es ninguna,
+  "telefono": "teléfono del cliente en la parte superior, formato 521XXXXXXXXXX sin espacios, vacío si no hay",
   "nombre": "nombre del cliente si aparece, vacío si no",
   "total": "monto total a pagar con símbolo si es nota, vacío si es guía",
   "desglose": "resumen breve del pedido si es nota",
-  "numero_guia": "número de guía/tracking si es guía, vacío si no",
+  "numero_guia": "número de guía si es guía, vacío si no",
   "paqueteria": "nombre paquetería si es guía, vacío si no"
 }`
           }
@@ -131,7 +133,6 @@ waClient.on("message", async (msg) => {
 
     const tel = datos.telefono.replace(/\D/g, "");
 
-    // ── NOTA → agregar a pendientes para elegir cuenta ────────────────────────
     if (datos.tipo === "nota") {
       const id = "nota_" + Date.now();
       pendientes[id] = {
@@ -139,23 +140,15 @@ waClient.on("message", async (msg) => {
         total: datos.total || "—", desglose: datos.desglose || "",
         media, mimeType, timestamp: new Date().toISOString()
       };
-      addLog("ok", `Nota de ${datos.nombre} (${tel}) lista — selecciona cuenta en la app`);
+      addLog("ok", `Nota de ${datos.nombre} (${tel}) lista — selecciona cuenta en el panel`);
     }
 
-    // ── GUÍA → mandar directo al cliente ─────────────────────────────────────
     if (datos.tipo === "guia") {
       const contactId = `${tel}@c.us`;
-      await waClient.sendMessage(contactId, media, {
-        caption: `Tu guía de envío está lista 📦`
-      });
+      await waClient.sendMessage(contactId, media, { caption: "Tu guía de envío está lista 📦" });
       await sleep(600);
       await waClient.sendMessage(contactId,
-`📦 *¡Tu guía de envío!*
-
-${datos.paqueteria ? `🚚 Paquetería: ${datos.paqueteria}\n` : ""}${datos.numero_guia ? `🔢 Guía: ${datos.numero_guia}\n` : ""}
-Ya puedes rastrear tu paquete en el sitio de la paquetería.
-
-¡Gracias por tu compra! 🙏`
+`📦 *¡Tu guía de envío!*\n\n${datos.paqueteria ? `🚚 Paquetería: ${datos.paqueteria}\n` : ""}${datos.numero_guia ? `🔢 Guía: ${datos.numero_guia}\n` : ""}\nYa puedes rastrear tu paquete.\n\n¡Gracias por tu compra! 🙏`
       );
       addLog("ok", `Guía enviada a ${datos.nombre || tel}`);
     }
@@ -165,7 +158,6 @@ Ya puedes rastrear tu paquete en el sitio de la paquetería.
   }
 });
 
-// ── ENVIAR NOTA A CLIENTE con cuenta seleccionada ─────────────────────────────
 async function enviarNota(pendienteId, cuentaId) {
   const p = pendientes[pendienteId];
   if (!p) throw new Error("Pendiente no encontrado");
@@ -174,30 +166,11 @@ async function enviarNota(pendienteId, cuentaId) {
   if (!cuenta) throw new Error("Cuenta no encontrada");
 
   const contactId = `${p.tel}@c.us`;
-
-  // 1. Mandar PDF de la nota
-  await waClient.sendMessage(contactId, p.media, {
-    caption: `Tu nota de pedido — ${p.nombre}`
-  });
+  await waClient.sendMessage(contactId, p.media, { caption: `Tu nota de pedido — ${p.nombre}` });
   await sleep(700);
 
-  // 2. Mandar mensaje con total + datos bancarios
   const mensaje =
-`Hola ${p.nombre} 👋
-
-Aquí está tu nota de pedido 📋
-${p.desglose ? `\n${p.desglose}\n` : ""}
-💰 *Total a pagar: ${p.total}*
-
-━━━━━━━━━━━━━━━━━
-🏦 *Datos para transferencia:*
-• Banco: ${cuenta.banco}
-• Titular: ${cuenta.titular}
-• CLABE: ${cuenta.clabe}${cuenta.tarjeta ? `\n• Tarjeta: ${cuenta.tarjeta}` : ""}
-• Concepto: ${p.nombre}
-━━━━━━━━━━━━━━━━━
-
-Una vez realizado el pago, envíame el *comprobante* y te mandamos tu guía de envío 🚚🙏`;
+`Hola ${p.nombre} 👋\n\nAquí está tu nota de pedido 📋\n${p.desglose ? `\n${p.desglose}\n` : ""}\n💰 *Total a pagar: ${p.total}*\n\n━━━━━━━━━━━━━━━━━\n🏦 *Datos para transferencia:*\n• Banco: ${cuenta.banco}\n• Titular: ${cuenta.titular}\n• CLABE: ${cuenta.clabe}${cuenta.tarjeta ? `\n• Tarjeta: ${cuenta.tarjeta}` : ""}\n• Concepto: ${p.nombre}\n━━━━━━━━━━━━━━━━━\n\nUna vez realizado el pago, envíame el *comprobante* y te mandamos tu guía 🚚🙏`;
 
   await waClient.sendMessage(contactId, mensaje);
   delete pendientes[pendienteId];
@@ -206,23 +179,14 @@ Una vez realizado el pago, envíame el *comprobante* y te mandamos tu guía de e
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── EXPRESS — PANEL WEB ───────────────────────────────────────────────────────
+// ── EXPRESS ───────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-app.get("/api/status", (_, res) => {
-  res.json({ waReady, qrDataUrl, groupId, GROUP_NAME });
-});
-
-app.get("/api/pendientes", (_, res) => {
-  res.json(Object.values(pendientes));
-});
-
-app.get("/api/cuentas", (_, res) => {
-  res.json(loadCuentas());
-});
-
+app.get("/api/status", (_, res) => res.json({ waReady, qrDataUrl, groupId, GROUP_NAME }));
+app.get("/api/pendientes", (_, res) => res.json(Object.values(pendientes)));
+app.get("/api/cuentas", (_, res) => res.json(loadCuentas()));
 app.post("/api/cuentas", (req, res) => {
   const { banco, titular, clabe, tarjeta } = req.body;
   if (!banco || !titular || !clabe) return res.status(400).json({ error: "Faltan campos" });
@@ -232,27 +196,19 @@ app.post("/api/cuentas", (req, res) => {
   saveCuentas(cuentas);
   res.json(nueva);
 });
-
 app.delete("/api/cuentas/:id", (req, res) => {
   let cuentas = loadCuentas();
   cuentas = cuentas.filter(c => c.id !== req.params.id);
   saveCuentas(cuentas);
   res.json({ ok: true });
 });
-
 app.post("/api/enviar", async (req, res) => {
   const { pendienteId, cuentaId } = req.body;
-  try {
-    await enviarNota(pendienteId, cuentaId);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  try { await enviarNota(pendienteId, cuentaId); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-app.get("/api/logs", (_, res) => {
-  res.json(logs);
-});
+app.get("/api/logs", (_, res) => res.json(logs));
+app.get("/", (_, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 
 http.createServer(app).listen(PORT, () => {
   addLog("info", `Panel web en http://localhost:${PORT}`);
