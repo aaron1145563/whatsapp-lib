@@ -1,10 +1,15 @@
-const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  downloadMediaMessage
+} = require("@whiskeysockets/baileys");
+const pino = require("pino");
 const express = require("express");
 const qrcode = require("qrcode");
 const Anthropic = require("@anthropic-ai/sdk");
 const fs = require("fs");
 const path = require("path");
-const http = require("http");
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 const GROUP_NAME        = process.env.GROUP_NAME || "";
@@ -21,6 +26,9 @@ function saveCuentas(c) { fs.writeFileSync(CUENTAS_FILE, JSON.stringify(c, null,
 const pendientes = {};
 let groupId = null;
 const logs = [];
+let sock = null;
+let qrDataUrl = null;
+let waReady = false;
 
 function addLog(tipo, msg) {
   const entry = { tipo, msg, time: new Date().toLocaleTimeString("es-MX") };
@@ -29,87 +37,94 @@ function addLog(tipo, msg) {
   console.log(`[${tipo.toUpperCase()}] ${msg}`);
 }
 
-// ── WHATSAPP CLIENT ── con puppeteer configurado para Render ─────────────────
-const waClient = new Client({
-  authStrategy: new LocalAuth({ dataPath: ".wa-session" }),
-  puppeteer: {
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-accelerated-2d-canvas",
-      "--no-first-run",
-      "--no-zygote",
-      "--single-process",
-      "--disable-gpu"
-    ]
-  }
-});
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-let qrDataUrl = null;
-let waReady = false;
+async function connectWA() {
+  const { state, saveCreds } = await useMultiFileAuthState(".wa-session");
 
-waClient.on("qr", async (qr) => {
-  qrDataUrl = await qrcode.toDataURL(qr);
-  waReady = false;
-  addLog("info", "QR generado — escanea con tu WhatsApp");
-});
+  sock = makeWASocket({
+    auth: state,
+    logger: pino({ level: "silent" }),
+    printQRInTerminal: true,
+    browser: ["Bot Libros", "Chrome", "1.0"]
+  });
 
-waClient.on("ready", () => {
-  waReady = true;
-  qrDataUrl = null;
-  addLog("ok", "WhatsApp conectado ✅");
-});
+  sock.ev.on("creds.update", saveCreds);
 
-waClient.on("disconnected", () => {
-  waReady = false;
-  addLog("error", "WhatsApp desconectado");
-});
-
-waClient.on("message", async (msg) => {
-  try {
-    const chat = await msg.getChat();
-
-    if (chat.isGroup && !groupId) {
-      if (!GROUP_NAME || chat.name.toLowerCase().includes(GROUP_NAME.toLowerCase())) {
-        groupId = chat.id._serialized;
-        addLog("info", `Grupo detectado: "${chat.name}" → ${groupId}`);
-      }
+  sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      qrDataUrl = await qrcode.toDataURL(qr);
+      waReady = false;
+      addLog("info", "QR listo — ábrelo en el panel y escanea con tu WhatsApp");
     }
+    if (connection === "open") {
+      waReady = true;
+      qrDataUrl = null;
+      addLog("ok", "WhatsApp conectado ✅");
+    }
+    if (connection === "close") {
+      waReady = false;
+      const code = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      addLog("error", `Desconectado (código ${code}) — ${shouldReconnect ? "reconectando..." : "sesión cerrada"}`);
+      if (shouldReconnect) { await sleep(3000); connectWA(); }
+    }
+  });
 
-    if (!chat.isGroup) return;
-    if (groupId && chat.id._serialized !== groupId) return;
-    if (!msg.hasMedia) return;
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+    for (const msg of messages) {
+      if (msg.key.fromMe) continue;
+      const from = msg.key.remoteJid;
+      if (!from.endsWith("@g.us")) continue;
 
-    const tipo = msg.type;
-    if (!["document", "image"].includes(tipo)) return;
+      if (!groupId && GROUP_NAME) {
+        try {
+          const meta = await sock.groupMetadata(from);
+          if (meta.subject.toLowerCase().includes(GROUP_NAME.toLowerCase())) {
+            groupId = from;
+            addLog("info", `Grupo detectado: "${meta.subject}"`);
+          } else continue;
+        } catch { continue; }
+      }
 
-    addLog("info", `Archivo recibido en grupo (${tipo}) — analizando con IA...`);
+      if (groupId && from !== groupId) continue;
 
-    const media = await msg.downloadMedia();
-    if (!media) return;
+      const hasDoc = !!msg.message?.documentMessage;
+      const hasImg = !!msg.message?.imageMessage;
+      if (!hasDoc && !hasImg) continue;
 
-    const b64 = media.data;
-    const mimeType = media.mimetype;
-    const isPDF = mimeType === "application/pdf";
+      addLog("info", "Archivo recibido en grupo — analizando con IA...");
 
-    const contentBlock = isPDF
-      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } }
-      : { type: "image", source: { type: "base64", media_type: mimeType || "image/jpeg", data: b64 } };
+      try {
+        const buffer = await downloadMediaMessage(msg, "buffer", {}, {
+          logger: pino({ level: "silent" }),
+          reuploadRequest: sock.updateMediaMessage
+        });
 
-    const aiResp = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 600,
-      messages: [{
-        role: "user",
-        content: [
-          contentBlock,
-          {
-            type: "text",
-            text: `Analiza este documento. Responde SOLO con JSON sin markdown:
+        const mimeType = hasDoc
+          ? msg.message.documentMessage.mimetype
+          : msg.message.imageMessage.mimetype;
+
+        const b64 = buffer.toString("base64");
+        const isPDF = mimeType === "application/pdf";
+
+        const contentBlock = isPDF
+          ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } }
+          : { type: "image", source: { type: "base64", media_type: mimeType || "image/jpeg", data: b64 } };
+
+        const aiResp = await anthropic.messages.create({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 600,
+          messages: [{
+            role: "user",
+            content: [
+              contentBlock,
+              {
+                type: "text",
+                text: `Analiza este documento. Responde SOLO con JSON sin markdown:
 {
-  "tipo": "nota" si es cotización/nota de pedido, "guia" si es guía de envío, "otro" si no es ninguna,
+  "tipo": "nota" si es cotización o nota de pedido, "guia" si es guía de envío, "otro" si no es ninguna,
   "telefono": "teléfono del cliente en la parte superior, formato 521XXXXXXXXXX sin espacios, vacío si no hay",
   "nombre": "nombre del cliente si aparece, vacío si no",
   "total": "monto total a pagar con símbolo si es nota, vacío si es guía",
@@ -117,46 +132,50 @@ waClient.on("message", async (msg) => {
   "numero_guia": "número de guía si es guía, vacío si no",
   "paqueteria": "nombre paquetería si es guía, vacío si no"
 }`
-          }
-        ]
-      }]
-    });
+              }
+            ]
+          }]
+        });
 
-    const raw = aiResp.content.map(c => c.text || "").join("").replace(/```json|```/g, "").trim();
-    let datos;
-    try { datos = JSON.parse(raw); } catch { addLog("error", "IA no pudo parsear: " + raw); return; }
+        const raw = aiResp.content.map(c => c.text || "").join("").replace(/```json|```/g, "").trim();
+        let datos;
+        try { datos = JSON.parse(raw); } catch { addLog("error", "Error parseando IA: " + raw); continue; }
 
-    addLog("info", `IA detectó: tipo=${datos.tipo} | cliente=${datos.nombre} | tel=${datos.telefono}`);
+        addLog("info", `IA detectó: ${datos.tipo} | ${datos.nombre} | ${datos.telefono}`);
 
-    if (datos.tipo === "otro") return;
-    if (!datos.telefono) { addLog("warn", "No se encontró teléfono en el documento"); return; }
+        if (datos.tipo === "otro") continue;
+        if (!datos.telefono) { addLog("warn", "No se encontró teléfono en el documento"); continue; }
 
-    const tel = datos.telefono.replace(/\D/g, "");
+        const tel = datos.telefono.replace(/\D/g, "") + "@s.whatsapp.net";
 
-    if (datos.tipo === "nota") {
-      const id = "nota_" + Date.now();
-      pendientes[id] = {
-        id, tel, nombre: datos.nombre || "Cliente",
-        total: datos.total || "—", desglose: datos.desglose || "",
-        media, mimeType, timestamp: new Date().toISOString()
-      };
-      addLog("ok", `Nota de ${datos.nombre} (${tel}) lista — selecciona cuenta en el panel`);
+        if (datos.tipo === "nota") {
+          const id = "nota_" + Date.now();
+          pendientes[id] = {
+            id, tel, nombre: datos.nombre || "Cliente",
+            total: datos.total || "—", desglose: datos.desglose || "",
+            buffer, mimeType, isPDF, timestamp: new Date().toISOString()
+          };
+          addLog("ok", `Nota de ${datos.nombre} lista — selecciona cuenta en el panel`);
+        }
+
+        if (datos.tipo === "guia") {
+          await sock.sendMessage(tel, {
+            document: buffer, mimetype: mimeType,
+            fileName: "guia_envio.pdf", caption: "Tu guía de envío está lista 📦"
+          });
+          await sleep(600);
+          await sock.sendMessage(tel, {
+            text: `📦 *¡Tu guía de envío!*\n\n${datos.paqueteria ? `🚚 Paquetería: ${datos.paqueteria}\n` : ""}${datos.numero_guia ? `🔢 Guía: ${datos.numero_guia}\n` : ""}\nYa puedes rastrear tu paquete.\n\n¡Gracias por tu compra! 🙏`
+          });
+          addLog("ok", `Guía enviada a ${datos.nombre || tel}`);
+        }
+
+      } catch (e) {
+        addLog("error", "Error procesando archivo: " + e.message);
+      }
     }
-
-    if (datos.tipo === "guia") {
-      const contactId = `${tel}@c.us`;
-      await waClient.sendMessage(contactId, media, { caption: "Tu guía de envío está lista 📦" });
-      await sleep(600);
-      await waClient.sendMessage(contactId,
-`📦 *¡Tu guía de envío!*\n\n${datos.paqueteria ? `🚚 Paquetería: ${datos.paqueteria}\n` : ""}${datos.numero_guia ? `🔢 Guía: ${datos.numero_guia}\n` : ""}\nYa puedes rastrear tu paquete.\n\n¡Gracias por tu compra! 🙏`
-      );
-      addLog("ok", `Guía enviada a ${datos.nombre || tel}`);
-    }
-
-  } catch (e) {
-    addLog("error", "Error procesando mensaje: " + e.message);
-  }
-});
+  });
+}
 
 async function enviarNota(pendienteId, cuentaId) {
   const p = pendientes[pendienteId];
@@ -165,27 +184,42 @@ async function enviarNota(pendienteId, cuentaId) {
   const cuenta = cuentas.find(c => c.id === cuentaId);
   if (!cuenta) throw new Error("Cuenta no encontrada");
 
-  const contactId = `${p.tel}@c.us`;
-  await waClient.sendMessage(contactId, p.media, { caption: `Tu nota de pedido — ${p.nombre}` });
+  await sock.sendMessage(p.tel, {
+    document: p.buffer, mimetype: p.mimeType,
+    fileName: "nota_pedido.pdf", caption: `Tu nota de pedido — ${p.nombre}`
+  });
   await sleep(700);
 
   const mensaje =
-`Hola ${p.nombre} 👋\n\nAquí está tu nota de pedido 📋\n${p.desglose ? `\n${p.desglose}\n` : ""}\n💰 *Total a pagar: ${p.total}*\n\n━━━━━━━━━━━━━━━━━\n🏦 *Datos para transferencia:*\n• Banco: ${cuenta.banco}\n• Titular: ${cuenta.titular}\n• CLABE: ${cuenta.clabe}${cuenta.tarjeta ? `\n• Tarjeta: ${cuenta.tarjeta}` : ""}\n• Concepto: ${p.nombre}\n━━━━━━━━━━━━━━━━━\n\nUna vez realizado el pago, envíame el *comprobante* y te mandamos tu guía 🚚🙏`;
+`Hola ${p.nombre} 👋
 
-  await waClient.sendMessage(contactId, mensaje);
+Aquí está tu nota de pedido 📋
+${p.desglose ? `\n${p.desglose}\n` : ""}
+💰 *Total a pagar: ${p.total}*
+
+━━━━━━━━━━━━━━━━━
+🏦 *Datos para transferencia:*
+- Banco: ${cuenta.banco}
+- Titular: ${cuenta.titular}
+- CLABE: ${cuenta.clabe}${cuenta.tarjeta ? `\n• Tarjeta: ${cuenta.tarjeta}` : ""}
+- Concepto: ${p.nombre}
+━━━━━━━━━━━━━━━━━
+
+Una vez realizado el pago, envíame el *comprobante* y te mandamos tu guía 🚚🙏`;
+
+  await sock.sendMessage(p.tel, { text: mensaje });
   delete pendientes[pendienteId];
-  addLog("ok", `Nota + datos de ${cuenta.banco} enviados a ${p.nombre} (${p.tel})`);
+  addLog("ok", `Nota + datos de ${cuenta.banco} enviados a ${p.nombre}`);
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// ── EXPRESS ───────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/api/status", (_, res) => res.json({ waReady, qrDataUrl, groupId, GROUP_NAME }));
-app.get("/api/pendientes", (_, res) => res.json(Object.values(pendientes)));
+app.get("/api/pendientes", (_, res) => res.json(Object.values(pendientes).map(p => ({
+  id: p.id, tel: p.tel, nombre: p.nombre, total: p.total, desglose: p.desglose, timestamp: p.timestamp
+}))));
 app.get("/api/cuentas", (_, res) => res.json(loadCuentas()));
 app.post("/api/cuentas", (req, res) => {
   const { banco, titular, clabe, tarjeta } = req.body;
@@ -208,9 +242,8 @@ app.post("/api/enviar", async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get("/api/logs", (_, res) => res.json(logs));
-app.get("/", (_, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 
-http.createServer(app).listen(PORT, () => {
-  addLog("info", `Panel web en http://localhost:${PORT}`);
-  waClient.initialize();
+app.listen(PORT, () => {
+  addLog("info", `Panel web en puerto ${PORT}`);
+  connectWA();
 });
