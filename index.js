@@ -2,18 +2,19 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  downloadMediaMessage
+  downloadMediaMessage,
+  makeCacheableSignalKeyStore
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const express = require("express");
-const qrcode = require("qrcode");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GROUP_NAME     = process.env.GROUP_NAME || "";
-const PORT           = process.env.PORT || 3000;
+const GEMINI_API_KEY  = process.env.GEMINI_API_KEY || "";
+const GROUP_NAME      = process.env.GROUP_NAME || "";
+const PHONE_NUMBER    = process.env.PHONE_NUMBER || "";
+const PORT            = process.env.PORT || 3000;
 
 const CUENTAS_FILE = path.join(__dirname, "cuentas.json");
 function loadCuentas() {
@@ -25,8 +26,9 @@ const pendientes = {};
 let groupId = null;
 const logs = [];
 let sock = null;
-let qrDataUrl = null;
 let waReady = false;
+let pairingCode = null;
+let pairingRequested = false;
 
 function addLog(tipo, msg) {
   const entry = { tipo, msg, time: new Date().toLocaleTimeString("es-MX") };
@@ -55,31 +57,44 @@ async function connectWA() {
   const { state, saveCreds } = await useMultiFileAuthState(".wa-session");
 
   sock = makeWASocket({
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" }))
+    },
     logger: pino({ level: "silent" }),
-    printQRInTerminal: true,
-    browser: ["Bot Libros", "Chrome", "1.0"]
+    printQRInTerminal: false,
+    mobile: false,
+    browser: ["Ubuntu", "Chrome", "20.0.04"],
   });
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      qrDataUrl = await qrcode.toDataURL(qr);
-      waReady = false;
-      addLog("info", "QR listo — ábrelo en el panel y escanea con tu WhatsApp");
+  sock.ev.on("connection.update", async ({ connection, lastDisconnect }) => {
+    if (!pairingRequested && !sock.authState.creds.registered && PHONE_NUMBER) {
+      pairingRequested = true;
+      await sleep(2000);
+      try {
+        const code = await sock.requestPairingCode(PHONE_NUMBER.replace(/\D/g, ""));
+        pairingCode = code;
+        addLog("ok", `Código de vinculación: ${code} — ingrésalo en WhatsApp > Dispositivos vinculados > Vincular con número`);
+      } catch (e) {
+        addLog("error", "Error solicitando código: " + e.message);
+      }
     }
+
     if (connection === "open") {
       waReady = true;
-      qrDataUrl = null;
+      pairingCode = null;
       addLog("ok", "WhatsApp conectado ✅");
     }
+
     if (connection === "close") {
       waReady = false;
+      pairingRequested = false;
       const code = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
-      addLog("error", `Desconectado (código ${code}) — ${shouldReconnect ? "reconectando..." : "sesión cerrada"}`);
-      if (shouldReconnect) { await sleep(3000); connectWA(); }
+      addLog("error", `Desconectado — ${shouldReconnect ? "reconectando..." : "sesión cerrada"}`);
+      if (shouldReconnect) { await sleep(5000); connectWA(); }
     }
   });
 
@@ -106,7 +121,7 @@ async function connectWA() {
       const hasImg = !!msg.message?.imageMessage;
       if (!hasDoc && !hasImg) continue;
 
-      addLog("info", "Archivo recibido en grupo — analizando con Gemini...");
+      addLog("info", "Archivo recibido — analizando con Gemini...");
 
       try {
         const buffer = await downloadMediaMessage(msg, "buffer", {}, {
@@ -134,12 +149,12 @@ async function connectWA() {
         const raw = await analizarConGemini(b64, mimeType, prompt);
         const clean = raw.replace(/```json|```/g, "").trim();
         let datos;
-        try { datos = JSON.parse(clean); } catch { addLog("error", "Error parseando Gemini: " + raw); continue; }
+        try { datos = JSON.parse(clean); } catch { addLog("error", "Error parseando: " + raw); continue; }
 
-        addLog("info", `Gemini detectó: ${datos.tipo} | ${datos.nombre} | ${datos.telefono}`);
+        addLog("info", `Detectado: ${datos.tipo} | ${datos.nombre} | ${datos.telefono}`);
 
         if (datos.tipo === "otro") continue;
-        if (!datos.telefono) { addLog("warn", "No se encontró teléfono en el documento"); continue; }
+        if (!datos.telefono) { addLog("warn", "No se encontró teléfono"); continue; }
 
         const tel = datos.telefono.replace(/\D/g, "") + "@s.whatsapp.net";
 
@@ -166,7 +181,7 @@ async function connectWA() {
         }
 
       } catch (e) {
-        addLog("error", "Error procesando archivo: " + e.message);
+        addLog("error", "Error: " + e.message);
       }
     }
   });
@@ -204,14 +219,14 @@ Una vez realizado el pago, envíame el *comprobante* y te mandamos tu guía 🚚
 
   await sock.sendMessage(p.tel, { text: mensaje });
   delete pendientes[pendienteId];
-  addLog("ok", `Nota + datos de ${cuenta.banco} enviados a ${p.nombre}`);
+  addLog("ok", `Nota enviada a ${p.nombre}`);
 }
 
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-app.get("/api/status", (_, res) => res.json({ waReady, qrDataUrl, groupId, GROUP_NAME }));
+app.get("/api/status", (_, res) => res.json({ waReady, pairingCode, groupId }));
 app.get("/api/pendientes", (_, res) => res.json(Object.values(pendientes).map(p => ({
   id: p.id, tel: p.tel, nombre: p.nombre, total: p.total, desglose: p.desglose, timestamp: p.timestamp
 }))));
