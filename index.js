@@ -72,7 +72,7 @@ async function connectWA() {
   sock.ev.on("connection.update", async ({ connection, lastDisconnect }) => {
     if (!pairingRequested && !sock.authState.creds.registered && PHONE_NUMBER) {
       pairingRequested = true;
-      await sleep(2000);
+      await sleep(15000);
       try {
         const code = await sock.requestPairingCode(PHONE_NUMBER.replace(/\D/g, ""));
         pairingCode = code;
