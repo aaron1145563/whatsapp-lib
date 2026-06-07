@@ -7,15 +7,13 @@ const {
 const pino = require("pino");
 const express = require("express");
 const qrcode = require("qrcode");
-const Anthropic = require("@anthropic-ai/sdk");
+const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
-const GROUP_NAME        = process.env.GROUP_NAME || "";
-const PORT              = process.env.PORT || 3000;
-
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GROUP_NAME     = process.env.GROUP_NAME || "";
+const PORT           = process.env.PORT || 3000;
 
 const CUENTAS_FILE = path.join(__dirname, "cuentas.json");
 function loadCuentas() {
@@ -38,6 +36,20 @@ function addLog(tipo, msg) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function analizarConGemini(b64, mimeType, prompt) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{
+      parts: [
+        { inline_data: { mime_type: mimeType, data: b64 } },
+        { text: prompt }
+      ]
+    }]
+  };
+  const resp = await axios.post(url, body, { headers: { "Content-Type": "application/json" } });
+  return resp.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+}
 
 async function connectWA() {
   const { state, saveCreds } = await useMultiFileAuthState(".wa-session");
@@ -94,7 +106,7 @@ async function connectWA() {
       const hasImg = !!msg.message?.imageMessage;
       if (!hasDoc && !hasImg) continue;
 
-      addLog("info", "Archivo recibido en grupo — analizando con IA...");
+      addLog("info", "Archivo recibido en grupo — analizando con Gemini...");
 
       try {
         const buffer = await downloadMediaMessage(msg, "buffer", {}, {
@@ -107,22 +119,8 @@ async function connectWA() {
           : msg.message.imageMessage.mimetype;
 
         const b64 = buffer.toString("base64");
-        const isPDF = mimeType === "application/pdf";
 
-        const contentBlock = isPDF
-          ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } }
-          : { type: "image", source: { type: "base64", media_type: mimeType || "image/jpeg", data: b64 } };
-
-        const aiResp = await anthropic.messages.create({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 600,
-          messages: [{
-            role: "user",
-            content: [
-              contentBlock,
-              {
-                type: "text",
-                text: `Analiza este documento. Responde SOLO con JSON sin markdown:
+        const prompt = `Analiza este documento. Responde SOLO con JSON sin markdown ni backticks:
 {
   "tipo": "nota" si es cotización o nota de pedido, "guia" si es guía de envío, "otro" si no es ninguna,
   "telefono": "teléfono del cliente en la parte superior, formato 521XXXXXXXXXX sin espacios, vacío si no hay",
@@ -131,17 +129,14 @@ async function connectWA() {
   "desglose": "resumen breve del pedido si es nota",
   "numero_guia": "número de guía si es guía, vacío si no",
   "paqueteria": "nombre paquetería si es guía, vacío si no"
-}`
-              }
-            ]
-          }]
-        });
+}`;
 
-        const raw = aiResp.content.map(c => c.text || "").join("").replace(/```json|```/g, "").trim();
+        const raw = await analizarConGemini(b64, mimeType, prompt);
+        const clean = raw.replace(/```json|```/g, "").trim();
         let datos;
-        try { datos = JSON.parse(raw); } catch { addLog("error", "Error parseando IA: " + raw); continue; }
+        try { datos = JSON.parse(clean); } catch { addLog("error", "Error parseando Gemini: " + raw); continue; }
 
-        addLog("info", `IA detectó: ${datos.tipo} | ${datos.nombre} | ${datos.telefono}`);
+        addLog("info", `Gemini detectó: ${datos.tipo} | ${datos.nombre} | ${datos.telefono}`);
 
         if (datos.tipo === "otro") continue;
         if (!datos.telefono) { addLog("warn", "No se encontró teléfono en el documento"); continue; }
@@ -153,7 +148,7 @@ async function connectWA() {
           pendientes[id] = {
             id, tel, nombre: datos.nombre || "Cliente",
             total: datos.total || "—", desglose: datos.desglose || "",
-            buffer, mimeType, isPDF, timestamp: new Date().toISOString()
+            buffer, mimeType, timestamp: new Date().toISOString()
           };
           addLog("ok", `Nota de ${datos.nombre} lista — selecciona cuenta en el panel`);
         }
@@ -226,15 +221,13 @@ app.post("/api/cuentas", (req, res) => {
   if (!banco || !titular || !clabe) return res.status(400).json({ error: "Faltan campos" });
   const cuentas = loadCuentas();
   const nueva = { id: "c" + Date.now(), banco, titular, clabe, tarjeta: tarjeta || "" };
-  cuentas.push(nueva);
-  saveCuentas(cuentas);
+  cuentas.push(nueva); saveCuentas(cuentas);
   res.json(nueva);
 });
 app.delete("/api/cuentas/:id", (req, res) => {
   let cuentas = loadCuentas();
   cuentas = cuentas.filter(c => c.id !== req.params.id);
-  saveCuentas(cuentas);
-  res.json({ ok: true });
+  saveCuentas(cuentas); res.json({ ok: true });
 });
 app.post("/api/enviar", async (req, res) => {
   const { pendienteId, cuentaId } = req.body;
