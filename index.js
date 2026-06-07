@@ -7,14 +7,14 @@ const {
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const express = require("express");
+const qrcode = require("qrcode");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
-const GEMINI_API_KEY  = process.env.GEMINI_API_KEY || "";
-const GROUP_NAME      = process.env.GROUP_NAME || "";
-const PHONE_NUMBER    = process.env.PHONE_NUMBER || "";
-const PORT            = process.env.PORT || 3000;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GROUP_NAME     = process.env.GROUP_NAME || "";
+const PORT           = process.env.PORT || 3000;
 
 const CUENTAS_FILE = path.join(__dirname, "cuentas.json");
 function loadCuentas() {
@@ -27,8 +27,7 @@ let groupId = null;
 const logs = [];
 let sock = null;
 let waReady = false;
-let pairingCode = null;
-let pairingRequested = false;
+let qrDataUrl = null;
 
 function addLog(tipo, msg) {
   const entry = { tipo, msg, time: new Date().toLocaleTimeString("es-MX") };
@@ -63,38 +62,32 @@ async function connectWA() {
     },
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
-    mobile: false,
     browser: ["Ubuntu", "Chrome", "20.0.04"],
+    generateHighQualityLinkPreview: false,
   });
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", async ({ connection, lastDisconnect }) => {
-    if (!pairingRequested && !sock.authState.creds.registered && PHONE_NUMBER) {
-      pairingRequested = true;
-      await sleep(10000);
-      try {
-        const code = await sock.requestPairingCode(PHONE_NUMBER.replace(/\D/g, ""));
-        pairingCode = code;
-        addLog("ok", `Código de vinculación: ${code} — ingrésalo en WhatsApp > Dispositivos vinculados > Vincular con número`);
-      } catch (e) {
-        addLog("error", "Error solicitando código: " + e.message);
-      }
+  sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      qrDataUrl = await qrcode.toDataURL(qr);
+      waReady = false;
+      addLog("info", "QR listo — escanea en el panel web");
     }
 
     if (connection === "open") {
       waReady = true;
-      pairingCode = null;
+      qrDataUrl = null;
       addLog("ok", "WhatsApp conectado ✅");
     }
 
     if (connection === "close") {
       waReady = false;
-      pairingRequested = false;
+      qrDataUrl = null;
       const code = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
       addLog("error", `Desconectado — ${shouldReconnect ? "reconectando..." : "sesión cerrada"}`);
-      if (shouldReconnect) { await sleep(5000); connectWA(); }
+      if (shouldReconnect) { await sleep(3000); connectWA(); }
     }
   });
 
@@ -173,7 +166,7 @@ async function connectWA() {
             document: buffer, mimetype: mimeType,
             fileName: "guia_envio.pdf", caption: "Tu guía de envío está lista 📦"
           });
-          await sleep(60000);
+          await sleep(600);
           await sock.sendMessage(tel, {
             text: `📦 *¡Tu guía de envío!*\n\n${datos.paqueteria ? `🚚 Paquetería: ${datos.paqueteria}\n` : ""}${datos.numero_guia ? `🔢 Guía: ${datos.numero_guia}\n` : ""}\nYa puedes rastrear tu paquete.\n\n¡Gracias por tu compra! 🙏`
           });
@@ -226,7 +219,7 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-app.get("/api/status", (_, res) => res.json({ waReady, pairingCode, groupId }));
+app.get("/api/status", (_, res) => res.json({ waReady, qrDataUrl, groupId }));
 app.get("/api/pendientes", (_, res) => res.json(Object.values(pendientes).map(p => ({
   id: p.id, tel: p.tel, nombre: p.nombre, total: p.total, desglose: p.desglose, timestamp: p.timestamp
 }))));
