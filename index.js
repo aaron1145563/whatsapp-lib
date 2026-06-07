@@ -173,7 +173,7 @@ async function connectWA() {
             document: buffer, mimetype: mimeType,
             fileName: "guia_envio.pdf", caption: "Tu guía de envío está lista 📦"
           });
-          await sleep(600);
+          await sleep(60000);
           await sock.sendMessage(tel, {
             text: `📦 *¡Tu guía de envío!*\n\n${datos.paqueteria ? `🚚 Paquetería: ${datos.paqueteria}\n` : ""}${datos.numero_guia ? `🔢 Guía: ${datos.numero_guia}\n` : ""}\nYa puedes rastrear tu paquete.\n\n¡Gracias por tu compra! 🙏`
           });
